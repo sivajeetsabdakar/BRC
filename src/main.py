@@ -1,141 +1,169 @@
-def process_chunk(chunk_data):
-    """Process a chunk of data and return city statistics"""
-    local_stats = {}
-    
-    for line in chunk_data.split(b'\n'):
-        if not line.strip():
-            continue
-            
-        try:
-            line_text = line.decode('utf-8', errors='ignore').strip()
-            city, temp_str = line_text.split(';', 1)
-            temp = float(temp_str)
-            
-            if city in local_stats:
-                stats = local_stats[city]
-                if temp < stats[0]:
-                    stats[0] = temp
-                if temp > stats[2]:
-                    stats[2] = temp
-                stats[1] += temp
-                stats[3] += 1
-            else:
-                # [min, sum, max, count]
-                local_stats[city] = [temp, temp, temp, 1]
-        except (ValueError, IndexError, UnicodeDecodeError):
-            continue # badly fomed lines
-            
-    return local_stats
+import mmap
+import os
+import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
+import io
+import threading
 
-def main(input_file_name="testcase.txt", output_file_name="output.txt"):
-    """
+global_lock = threading.Lock()
 
-    Input format: city;temperature
-    Output format: city=min/mean/max (with 1 decimal place)
-    """
-    import multiprocessing as mp
-    import os
-    import mmap
-    import sys
+def process_chunk(args):
+    filepath, start, end = args
     
-    try:
-        file_size = os.path.getsize(input_file_name)
-        # For test files
-        if file_size < 1024 * 1024:  # < 1MB
-            use_multiprocessing = False
-        else:
-            use_multiprocessing = True
+    min_temps = {}
+    max_temps = {}
+    sum_temps = {}
+    counts = {}
+    
+    with open(filepath, 'r+b') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            pos = start
+            line_start = pos
             
-        
-        cpu_count = mp.cpu_count()
-        # Fewer processes for smaller files
-        if file_size < 100 * 1024 * 1024:  # <100MB
-            num_processes = max(2, min(4, cpu_count))
-        else:
-            num_processes = max(4, min(8, cpu_count))
-            
-    except (OSError, FileNotFoundError):
-        print(f"Error accessing file: {input_file_name}", file=sys.stderr)
-        return
-        
-    # Process the file
-    if use_multiprocessing:
-        # for large files
-        try:
-            with open(input_file_name, 'r+b') as f:
-                # Memory map 
-                mm = mmap.mmap(f.fileno(), 0)
-                
-                # chunk size - aim 
-                chunk_size = max(1024 * 1024, file_size // num_processes)  # > 1MB per chunk
-                
-                
-                chunks = []
-                start = 0
-                
-                while start < file_size:
-                    end = min(file_size, start + chunk_size)
+            while pos < end:
+                if mm[pos] == ord('\n'):
+                    line = mm[line_start:pos]
                     
-                    if end < file_size:
-                        mm.seek(end)
+                    sep_pos = -1
+                    for i in range(len(line)-1, -1, -1):
+                        if line[i] == ord(';'):
+                            sep_pos = i
+                            break
+                    
+                    if sep_pos != -1:
+                        city = bytes(line[:sep_pos])
                         try:
-                            mm.readline()
-                            end = mm.tell()
-                        except ValueError:
-                            end = file_size
+                            temp_str = line[sep_pos+1:]
+                            temp = float(temp_str)
+                            
+                            if city in min_temps:
+                                if temp < min_temps[city]:
+                                    min_temps[city] = temp
+                                if temp > max_temps[city]:
+                                    max_temps[city] = temp
+                                sum_temps[city] += temp
+                                counts[city] += 1
+                            else:
+                                min_temps[city] = temp
+                                max_temps[city] = temp
+                                sum_temps[city] = temp
+                                counts[city] = 1
+                                
+                        except (ValueError, IndexError):
+                            pass
                     
-                    mm.seek(start)
-                    chunk = mm.read(end - start)
-                    chunks.append(chunk)
-                    
-                    start = end
+                    line_start = pos + 1
                 
-                # in parallel
-                with mp.Pool(processes=num_processes) as pool:
-                    chunk_results = pool.map(process_chunk, chunks)
-                
-                mm.close()
-        except (IOError, ValueError, OSError) as e:
-            #  if memory mapping fails
-            print(f"Memory mapping failed, falling back to standard processing: {e}", file=sys.stderr)
-            use_multiprocessing = False
+                pos += 1
             
-    # fallback or for small files
-    if not use_multiprocessing:
-        try:
-            with open(input_file_name, 'rb') as f:
-                chunk_results = [process_chunk(f.read())]
-        except (IOError, OSError) as e:
-            print(f"Error reading file: {e}", file=sys.stderr)
-            return
+            if line_start < end:
+                line = mm[line_start:end]
+                sep_pos = -1
+                for i in range(len(line)-1, -1, -1):
+                    if line[i] == ord(';'):
+                        sep_pos = i
+                        break
+                
+                if sep_pos != -1:
+                    city = bytes(line[:sep_pos])
+                    try:
+                        temp_str = line[sep_pos+1:]
+                        temp = float(temp_str)
+                        
+                        if city in min_temps:
+                            if temp < min_temps[city]:
+                                min_temps[city] = temp
+                            if temp > max_temps[city]:
+                                max_temps[city] = temp
+                            sum_temps[city] += temp
+                            counts[city] += 1
+                        else:
+                            min_temps[city] = temp
+                            max_temps[city] = temp
+                            sum_temps[city] = temp
+                            counts[city] = 1
+                            
+                    except (ValueError, IndexError):
+                        pass
     
-    city_stats = {}
-    for local_stats in chunk_results:
-        for city, stats in local_stats.items():
-            min_temp, sum_temp, max_temp, count = stats
+    return min_temps, max_temps, sum_temps, counts
+
+def find_chunk_boundaries(filepath, start, end):
+    with open(filepath, 'r+b') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            if start > 0:
+                while start < end and mm[start-1] != ord('\n'):
+                    start += 1
             
-            if city in city_stats:
-                merged_stats = city_stats[city]
-                merged_stats[0] = min(merged_stats[0], min_temp) 
-                merged_stats[1] += sum_temp 
-                merged_stats[2] = max(merged_stats[2], max_temp) 
-                merged_stats[3] += count 
+            if end < len(mm):
+                while end < len(mm) and mm[end] != ord('\n'):
+                    end += 1
+                if end < len(mm):
+                    end += 1
+    
+    return start, end
+
+def merge_chunk_results(result, all_results):
+    min_temps, max_temps, sum_temps, counts = result
+    
+    with global_lock:
+        for city, min_val in min_temps.items():
+            if city in all_results[0]:
+                if min_val < all_results[0][city]:
+                    all_results[0][city] = min_val
+                if max_temps[city] > all_results[1][city]:
+                    all_results[1][city] = max_temps[city]
+                all_results[2][city] += sum_temps[city]
+                all_results[3][city] += counts[city]
             else:
-                city_stats[city] = stats.copy()
+                all_results[0][city] = min_val
+                all_results[1][city] = max_temps[city]
+                all_results[2][city] = sum_temps[city]
+                all_results[3][city] = counts[city]
+
+def main():
+    filepath = 'testcase.txt'
     
-    output_lines = []
-    for city in sorted(city_stats.keys()):
-        min_temp, sum_temps, max_temp, count = city_stats[city]
-        mean_temp = sum_temps / count
+    num_cpu = 4
+    num_processes = num_cpu * 2
+    file_size = os.path.getsize(filepath)
+    chunk_size = max(file_size // num_processes, 4 * 1024 * 1024)
+    
+    all_results = [{}, {}, {}, {}]
+    
+    tasks = []
+    
+    for i in range(0, file_size, chunk_size):
+        start = i
+        end = min(i + chunk_size, file_size)
         
-        formatted_result = f"{city}={min_temp:.1f}/{mean_temp:.1f}/{max_temp:.1f}"
-        output_lines.append(formatted_result)
+        start, end = find_chunk_boundaries(filepath, start, end)
+        
+        if end > start:
+            tasks.append((filepath, start, end))
     
-    try:
-        with open(output_file_name, 'w') as output_file:
-            output_file.write('\n'.join(output_lines))
-    except (IOError, OSError) as e:
-        print(f"Error writing output file: {e}", file=sys.stderr)
+    with mp.Pool(processes=num_processes) as pool:
+        with ThreadPoolExecutor(max_workers=num_processes) as executor:
+            for result in pool.imap_unordered(process_chunk, tasks):
+                executor.submit(merge_chunk_results, result, all_results)
+    
+    min_temps, max_temps, sum_temps, counts = all_results
+    cities = list(min_temps.keys())
+    cities.sort()
+    
+    with io.StringIO(newline='') as output:
+        for i, city in enumerate(cities):
+            city_str = city.decode('ascii') if isinstance(city, bytes) else city
+            mean_val = sum_temps[city] / counts[city]
+            output.write(f"{city_str}={min_temps[city]:.1f}/{mean_val:.1f}/{max_temps[city]:.1f}")
+            
+            if i < len(cities) - 1:
+                output.write('\n')
+        
+        output_content = output.getvalue()
+    
+    with open('output.txt', 'w') as f:
+        f.write(output_content)
 
 if __name__ == "__main__":
     main()
